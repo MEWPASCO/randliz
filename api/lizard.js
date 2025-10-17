@@ -16,6 +16,7 @@ const BLOCK_WORDS = [
 ];
 
 const QUERIES = [
+  "lizard"
   "lizard wildlife photo",
   "lizard macro photo",
   "gecko close up nature photo",
