@@ -1,5 +1,5 @@
-// api/lizard.js — SerpAPI Google Images, streams image/* bytes
-// Env: SERPAPI_KEY (if missing -> Wikimedia fallbacks)
+// api/lizard.js — fetch-only, streams image/* bytes
+// Env: SERPAPI_KEY (optional; we fallback to Wikimedia if missing)
 
 export const config = { api: { bodyParser: false } };
 
@@ -9,11 +9,10 @@ const BLOCK_SITES = [
   "dreamstime.", "depositphotos.", "freepik.", "pngtree."
 ];
 
-// keep this lighter than raccoon to avoid over-filtering
 const BLOCK_WORDS = [
   "sticker","clipart","svg","logo","vector","icon",
   "plush","plushie","toy","merch","tattoo","drawing",
-  "ai","midjourney","dalle","generated","meme","cartoon"
+  "ai","midjourney","dalle","generated","fursuit","meme","cartoon"
 ];
 
 const QUERIES = [
@@ -41,20 +40,15 @@ function setCORS(res){
   res.setHeader("Access-Control-Allow-Headers","Content-Type");
 }
 function setCache(res){
-  // shorter cache while debugging; bump later if you want
-  res.setHeader("Cache-Control","public, s-maxage=300, stale-while-revalidate=3600");
+  res.setHeader("Cache-Control","public, s-maxage=3600, stale-while-revalidate=43200");
 }
 function blockedSite(url){
-  try {
-    const h = new URL(url).hostname.toLowerCase();
-    return BLOCK_SITES.some(d=>h.includes(d));
-  } catch {
-    // don't nuke candidates just because URL parsing failed
-    return false;
-  }
+  try{ const h=new URL(url).hostname.toLowerCase();
+       return BLOCK_SITES.some(d=>h.includes(d));
+  }catch{ return true; }
 }
 function blockedWords(text=""){
-  const s = String(text).toLowerCase();
+  const s=String(text).toLowerCase();
   return BLOCK_WORDS.some(w=>s.includes(w));
 }
 async function fetchJSON(url){
@@ -86,76 +80,72 @@ export default async function handler(req,res){
   const serpKey = process.env.SERPAPI_KEY;
   const userQ = (req.query.q||"").toString().trim();
   const baseQuery = userQ || pick(QUERIES);
-  const debug = ((req.query.format||"").toString().toLowerCase()==="json");
 
-  // No key → serve Wikimedia fallback as bytes
+  // If no key, serve Wikimedia fallback as bytes
   if(!serpKey){
     setCache(res);
     const url = pick(FALLBACKS);
     const data = await fetchAsImage(url);
     if(!data) return res.status(500).json({ ok:false, error:"no_key_and_fallback_failed" });
 
-    if(debug) return res.status(200).json({ ok:true, source:"static_fallback", image:url, content_type:data.ct });
+    if((req.query.format||"").toString().toLowerCase()==="json"){
+      return res.status(200).json({ ok:true, source:"static_fallback", image:url, content_type:data.ct });
+    }
+
     res.setHeader("Content-Type", data.ct);
     res.setHeader("Content-Disposition", `inline; filename="lizard.${data.ext}"`);
     return res.status(200).send(data.buf);
   }
 
-  // Try multiple pages 0..5 and collect candidates
-  const all = [];
-  for (let ijn = 0; ijn < 6; ijn++) {
-    try {
-      const params = new URLSearchParams({
-        engine:"google_images",
-        q: `${baseQuery} -plush -toy -merch -clipart -sticker -logo -vector -cartoon`,
-        tbm:"isch",
-        tbs:"itp:photo,isz:l",
-        safe:"active",
-        ijn:String(ijn),
-        api_key:serpKey
-      });
-      const data = await fetchJSON(`https://serpapi.com/search.json?${params.toString()}`);
-      const list = Array.isArray(data.images_results) ? data.images_results : [];
-      for (const r of list) {
-        const url = r?.original || r?.thumbnail || "";
-        const title = r?.title || "";
-        if (!url) continue;
-        if (url.toLowerCase().endsWith(".svg")) continue;
-        if (blockedSite(url)) continue;
-        if (blockedWords(title)) continue;
-        all.push({ url, title });
-      }
-      // Stop early if we have enough
-      if (all.length >= 30) break;
-    } catch {
-      // keep going; we have fallbacks
-    }
+  // random page 0..5
+  const ijn = Math.floor(Math.random()*6);
+  const params = new URLSearchParams({
+    engine:"google_images",
+    q: `${baseQuery} -plush -toy -merch -clipart -sticker -logo -vector -cartoon`,
+    tbm:"isch",
+    tbs:"itp:photo,isz:l",
+    safe:"active",
+    ijn:String(ijn),
+    api_key:serpKey
+  });
+
+  let candidates=[];
+  try{
+    const data = await fetchJSON(`https://serpapi.com/search.json?${params.toString()}`);
+    candidates = Array.isArray(data.images_results) ? data.images_results : [];
+  }catch{
+    // fall through to static
   }
 
-  // Shuffle
-  for(let i=all.length-1;i>0;i--){
+  // minimal prefilter
+  candidates = candidates.filter(r=>{
+    const url = r?.original || r?.thumbnail || "";
+    const title = r?.title || "";
+    if(!url) return false;
+    if(blockedSite(url)) return false;
+    if(blockedWords(title)) return false;
+    if(url.toLowerCase().endsWith(".svg")) return false;
+    return true;
+  });
+
+  // shuffle
+  for(let i=candidates.length-1;i>0;i--){
     const j=Math.floor(Math.random()*(i+1));
-    [all[i],all[j]]=[all[j],all[i]];
+    [candidates[i],candidates[j]]=[candidates[j],candidates[i]];
   }
 
   setCache(res);
 
-  // Try up to 15 candidates
-  const tries = Math.min(15, all.length);
-  for(let i=0;i<tries;i++){
-    const url = all[i]?.url;
+  // try up to 10 candidates
+  const MAX_TRIES = Math.min(10, candidates.length);
+  for(let i=0;i<MAX_TRIES;i++){
+    const url = candidates[i]?.original || candidates[i]?.thumbnail;
     try{
       const data = await fetchAsImage(url);
       if(!data) continue;
 
-      if(debug){
-        return res.status(200).json({
-          ok:true,
-          source:"serpapi",
-          candidates: all.length,
-          picked: url,
-          content_type: data.ct
-        });
+      if((req.query.format||"").toString().toLowerCase()==="json"){
+        return res.status(200).json({ ok:true, source:"serpapi", image:url, content_type:data.ct });
       }
 
       res.setHeader("Content-Type", data.ct);
@@ -164,17 +154,20 @@ export default async function handler(req,res){
     }catch{/* next */}
   }
 
-  // Final static fallback
+  // static fallback
   try{
     const url = pick(FALLBACKS);
     const data = await fetchAsImage(url);
     if(!data) throw new Error("fallback failed");
 
-    if(debug) return res.status(200).json({ ok:true, source:"static_fallback", image:url, content_type:data.ct });
+    if((req.query.format||"").toString().toLowerCase()==="json"){
+      return res.status(200).json({ ok:true, source:"static_fallback", image:url, content_type:data.ct });
+    }
+
     res.setHeader("Content-Type", data.ct);
     res.setHeader("Content-Disposition", `inline; filename="lizard.${data.ext}"`);
     return res.status(200).send(data.buf);
   }catch{
-    return res.status(404).json({ ok:false, error:"no_usable_lizard_found", candidates: all.length });
+    return res.status(404).json({ ok:false, error:"no_usable_lizard_found" });
   }
 }
